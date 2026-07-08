@@ -1,21 +1,29 @@
-// 最小 Vulkan Layer：攔截 vkQueuePresentKHR 量 frametime，每秒印出 fps/min/max。
+// Minimal Vulkan layer: intercepts vkQueuePresentKHR, measures frametime, and
+// publishes fps/min/max once per second into a POSIX shared-memory buffer via
+// seqlock (SPSC, latest value wins). The reader side (Rust) is separate.
 //
-// 依 Vulkan Loader-Layer Interface 實作：
-//   - 必須匯出 vkGetInstanceProcAddr / vkGetDeviceProcAddr（loader 的進入點）
-//   - CreateInstance / CreateDevice 時把「下一層」的函式表存起來（dispatch table）
-//   - QueuePresentKHR 攔截量時間後，再呼叫下一層真正的 present
+// Env vars:
+//   LATENCY_SHM_NAME  shm name (default "/game_fps" -> /dev/shm/game_fps)
+//   LATENCY_VERBOSE   if set, also append per-second stats to this file path
 //
-// 參考：https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md
+// Ref: https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md
 
-#define _POSIX_C_SOURCE 200809L   // 讓 clock_gettime / CLOCK_MONOTONIC 可見
+#define _POSIX_C_SOURCE 200809L
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include <stdatomic.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+
+#include "fps_shm.h"
 
 // ---------------------------------------------------------------------------
 // 每個 device 一份的狀態：下一層函式指標 + frametime 統計
@@ -76,6 +84,60 @@ static void reset_window(DeviceData *d, uint64_t now) {
 }
 
 // ---------------------------------------------------------------------------
+// Shared-memory buffer (seqlock). Layout lives in fps_shm.h.
+// ---------------------------------------------------------------------------
+static FpsShm *g_shm = NULL;   // NULL if shm setup failed -> writes are skipped
+static FILE   *g_verbose = NULL;
+
+static void ipc_init(void) {
+    const char *name = getenv("LATENCY_SHM_NAME");
+    if (!name || !*name)
+        name = FPS_SHM_DEFAULT_NAME;
+
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0644);
+    if (fd < 0)
+        return;
+    if (ftruncate(fd, sizeof(FpsShm)) != 0) {
+        close(fd);
+        return;
+    }
+    void *p = mmap(NULL, sizeof(FpsShm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED)
+        return;
+    g_shm = (FpsShm *)p;
+
+    const char *vpath = getenv("LATENCY_VERBOSE");
+    if (vpath && *vpath)
+        g_verbose = fopen(vpath, "a");
+}
+
+static void publish_stats(double fps, double min_ms, double max_ms,
+                          uint64_t frames, uint64_t now) {
+    if (g_shm) {
+        uint32_t s = atomic_load_explicit(&g_shm->seq, memory_order_relaxed);
+        atomic_store_explicit(&g_shm->seq, s + 1, memory_order_relaxed);
+        atomic_thread_fence(memory_order_release);
+
+        g_shm->fps = fps;
+        g_shm->min_frametime_ms = min_ms;
+        g_shm->max_frametime_ms = max_ms;
+        g_shm->frame_count = frames;
+        g_shm->update_ns = now;
+
+        atomic_thread_fence(memory_order_release);
+        atomic_store_explicit(&g_shm->seq, s + 2, memory_order_relaxed);
+    }
+
+    if (g_verbose) {
+        fprintf(g_verbose,
+                "[latency] fps=%.1f  min_frametime=%.3f ms  max_frametime=%.3f ms  (frames=%llu)\n",
+                fps, min_ms, max_ms, (unsigned long long)frames);
+        fflush(g_verbose);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 攔截：QueuePresentKHR —— 每 frame present 一次
 // ---------------------------------------------------------------------------
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -101,17 +163,15 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
         }
         d->last_present_ns = now;
 
-        // 每 1 秒輸出一次
+        // publish once per second
         uint64_t elapsed = now - d->window_start_ns;
         if (elapsed >= 1000000000ull && d->frame_count > 0) {
             double secs = (double)elapsed / 1e9;
             double fps  = (double)d->frame_count / secs;
-            printf("[latency] fps=%.1f  min_frametime=%.3f ms  max_frametime=%.3f ms  (frames=%llu)\n",
-                   fps,
-                   (double)d->min_ft_ns / 1e6,
-                   (double)d->max_ft_ns / 1e6,
-                   (unsigned long long)d->frame_count);
-            fflush(stdout);
+            publish_stats(fps,
+                          (double)d->min_ft_ns / 1e6,
+                          (double)d->max_ft_ns / 1e6,
+                          d->frame_count, now);
             reset_window(d, now);
         }
     }
@@ -168,10 +228,12 @@ layer_CreateDevice(VkPhysicalDevice physicalDevice,
     if (res != VK_SUCCESS)
         return res;
 
-    // 記錄這個 device 的狀態
-    static DeviceData storage[16];  // 簡單起見：固定池，最多 16 個 device
+    // fixed pool, linear lookup; up to 16 devices
+    static DeviceData storage[16];
     static int used = 0;
     if (used < 16) {
+        if (used == 0)
+            ipc_init();
         DeviceData *d = &storage[used++];
         memset(d, 0, sizeof(*d));
         d->device = *pDevice;

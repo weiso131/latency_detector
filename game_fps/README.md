@@ -1,15 +1,17 @@
 # latency_creater
 
 一個最小的 **Vulkan Layer**，攔截 `vkQueuePresentKHR` 量 frametime，
-每 1 秒對 stdout 印出 **fps / min frametime / max frametime**。
+每 1 秒把 **fps / min frametime / max frametime** 用 seqlock 寫進一塊
+POSIX 共享記憶體（`/dev/shm/game_fps`），供另一端（Rust）讀取。
+共用的路徑與 struct 定義在 [`fps_shm.h`](./fps_shm.h)。
 
-輸出範例（vkcube，vsync 下鎖 ~60fps）：
+另外可選開啟 **verbose**，把每秒統計以文字輸出到指定檔案（見下方）：
 
 ```
 [latency] fps=59.9  min_frametime=4.506 ms  max_frametime=29.701 ms  (frames=60)
 ```
 
-原理與 MangoHud 研究筆記見 [`TODO.md`](./TODO.md)。
+共享 struct 與 seqlock 用法見 [`fps_shm.h`](./fps_shm.h)。
 
 ---
 
@@ -66,15 +68,48 @@ vkcube
 
 ---
 
+## 環境變數
+
+| 變數 | 預設 | 作用 |
+|------|------|------|
+| `LATENCY_SHM_NAME` | `/game_fps` | 共享記憶體名稱（對應 `/dev/shm/<name>`）。讀端要用同一個名稱。 |
+| `LATENCY_VERBOSE` | （未設） | **設了才輸出文字**：把每秒統計 append 到這個檔案路徑。沒設就只寫 shm、不輸出文字。 |
+
+### verbose 怎麼用
+
+預設**不會**有任何文字輸出（只寫共享記憶體）。想看每秒的 fps/frametime，
+設 `LATENCY_VERBOSE` 指向一個檔案：
+
+```bash
+export VK_LAYER_PATH="$(pwd)"
+export VK_LOADER_LAYERS_ENABLE="VK_LAYER_latency_creater"
+export LATENCY_VERBOSE=/tmp/latency.log     # 輸出寫到這個檔
+vkcube
+
+# 另一個終端即時看：
+tail -f /tmp/latency.log
+```
+
+輸出是 append（不覆蓋），每秒一行：
+
+```
+[latency] fps=59.9  min_frametime=4.506 ms  max_frametime=29.701 ms  (frames=60)
+```
+
+> 注意：verbose 輸出的是**檔案**，不是 stdout。因為 layer 跑在遊戲程序內，
+> 從 Steam 之類的啟動器不好接 stdout，寫檔比較可靠。
+
+---
+
 ## 檔案
 
 | 檔案 | 作用 |
 |------|------|
-| `latency_layer.c` | Layer 本體，攔截 `vkQueuePresentKHR` 量 frametime |
+| `latency_layer.c` | Layer 本體，攔截 `vkQueuePresentKHR` 量 frametime，寫 shm |
+| `fps_shm.h` | 共享記憶體路徑與 struct 定義（寫端 / 讀端共用） |
 | `latency_layer.json` | Layer manifest，讓 Vulkan loader 找到 `.so` |
 | `build.sh` | 編譯腳本 |
 | `run.sh` | 設好環境變數並執行 Vulkan 程式 |
-| `TODO.md` | MangoHud 機制研究筆記 + 實作踩坑 / 取捨 |
 
 ---
 
