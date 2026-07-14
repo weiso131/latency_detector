@@ -27,40 +27,35 @@
 
 #include "fps_shm.h"
 
-// How long to accumulate before publishing one snapshot.
-#define PUBLISH_INTERVAL_NS 1000000000ull
+// Length of one measurement window, once a sample has been requested.
+#define MEASURE_WINDOW_NS 1000000000ull
 
-// ---------------------------------------------------------------------------
-// 每個 device 一份的狀態：下一層函式指標 + frametime 統計
-// ---------------------------------------------------------------------------
+// Per-device state: next-layer function pointers + measurement accumulators.
 typedef struct DeviceData {
     VkDevice device;
-    PFN_vkGetDeviceProcAddr next_gdpa;   // 下一層的 GetDeviceProcAddr
-    PFN_vkQueuePresentKHR   next_present; // 下一層真正的 present
+    PFN_vkGetDeviceProcAddr next_gdpa;
+    PFN_vkQueuePresentKHR   next_present;
 
-    // frametime 統計
-    int      have_last;        // 是否已有上一次 present 時間
-    uint64_t last_present_ns;  // 上一次 present 的時間戳（奈秒）
-    uint64_t window_start_ns;  // 這一秒統計視窗的起點
+    int      have_last;        // seen a previous present (for frametime diff)
+    uint64_t last_present_ns;  // timestamp of the previous present
 
-    uint64_t frame_count;      // 這一秒累積的 frame 數
-    uint64_t min_ft_ns;        // 這一秒最小 frametime
-    uint64_t max_ft_ns;        // 這一秒最大 frametime
+    int      measuring;        // 1 while accumulating a requested window
+    uint64_t window_start_ns;
+    uint64_t frame_count;
+    uint64_t min_ft_ns;
+    uint64_t max_ft_ns;
 
-    struct DeviceData *next;   // 簡單的鏈結串列（多 device 情況）
+    struct DeviceData *next;   // linked list for multiple devices
 } DeviceData;
 
-// 用 dispatch key（VkDevice / VkQueue 的第一個指標欄位）當索引查表。
-// 這裡為求簡單，直接用鏈結串列線性找。
 static DeviceData *g_devices = NULL;
 
-// instance 的下一層 GetInstanceProcAddr。本 layer 只量 present，不攔任何
-// instance 函式，但仍必須把「沒攔截的名字」轉呼叫下一層，否則應用程式拿到
-// NULL 一呼叫就 segfault。為求最小實作用單一全域（假設只有一個 instance）。
+// Next-layer GetInstanceProcAddr. We intercept no instance functions but must
+// forward unknown names downwards, else the app gets NULL and crashes.
 static PFN_vkGetInstanceProcAddr g_next_gipa = NULL;
 
-// Vulkan 每個 dispatchable handle 開頭都是一個指向 dispatch table 的指標，
-// loader 用它來分辨物件。同一 device 底下的 queue 共用這個 key。
+// Every dispatchable handle starts with a pointer to its dispatch table; the
+// loader uses it to identify the object. Queues share their device's key.
 static void *get_dispatch_key(void *handle) {
     return *(void **)handle;
 }
@@ -89,7 +84,7 @@ static void reset_window(DeviceData *d, uint64_t now) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory buffer (seqlock). Layout lives in fps_shm.h.
+// Shared-memory buffer (request/response). Layout lives in fps_shm.h.
 // ---------------------------------------------------------------------------
 static FpsShm *g_shm = NULL;   // NULL if shm setup failed -> writes are skipped
 static FILE   *g_verbose = NULL;
@@ -117,30 +112,23 @@ static void ipc_init(void) {
         g_verbose = fopen(vpath, "a");
 }
 
-// Wake any reader waiting via FUTEX_WAIT on the seq word. Cheap (no-op) when
-// there is no waiter, so the writer never blocks.
-static void futex_wake_seq(void) {
-    syscall(SYS_futex, &g_shm->seq, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+// Wake the reader parked on FUTEX_WAIT(request). No-op if none is waiting.
+static void futex_wake_request(void) {
+    syscall(SYS_futex, &g_shm->request, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
 }
 
-static void publish_stats(double fps, double min_ms, double max_ms,
-                          uint64_t frames, uint64_t now) {
-    if (g_shm) {
-        uint32_t s = atomic_load_explicit(&g_shm->seq, memory_order_relaxed);
-        atomic_store_explicit(&g_shm->seq, s + 1, memory_order_relaxed);
-        atomic_thread_fence(memory_order_release);
+// Write one result, then release it: request = 0 marks "result ready" and, per
+// the handshake, guarantees we won't touch the buffer again until the reader
+// re-arms. The store-release publishes the field writes before request drops.
+static void write_result(double fps, double min_ms, double max_ms,
+                         uint64_t frames) {
+    g_shm->fps = fps;
+    g_shm->min_frametime_ms = min_ms;
+    g_shm->max_frametime_ms = max_ms;
+    g_shm->frame_count = frames;
 
-        g_shm->fps = fps;
-        g_shm->min_frametime_ms = min_ms;
-        g_shm->max_frametime_ms = max_ms;
-        g_shm->frame_count = frames;
-        g_shm->update_ns = now;
-
-        atomic_thread_fence(memory_order_release);
-        atomic_store_explicit(&g_shm->seq, s + 2, memory_order_relaxed);
-
-        futex_wake_seq();
-    }
+    atomic_store_explicit(&g_shm->request, 0, memory_order_release);
+    futex_wake_request();
 
     if (g_verbose) {
         fprintf(g_verbose,
@@ -150,41 +138,42 @@ static void publish_stats(double fps, double min_ms, double max_ms,
     }
 }
 
-// ---------------------------------------------------------------------------
-// 攔截：QueuePresentKHR —— 每 frame present 一次
-// ---------------------------------------------------------------------------
+// Intercepts each present. Only accumulates while the reader has requested a
+// sample (request == 1); otherwise it just tracks the last present time.
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     DeviceData *d = find_device_by_key(get_dispatch_key(queue));
-    if (!d || !d->next_present) {
-        // 沒記錄到這個 device（理論上不會發生）：無法往下呼叫，只能回錯
+    if (!d || !d->next_present)
         return VK_ERROR_INITIALIZATION_FAILED;
-    }
 
-    {
-        uint64_t now = now_ns();
+    uint64_t now = now_ns();
+    uint64_t last = d->last_present_ns;
+    int have_last = d->have_last;
+    d->last_present_ns = now;
+    d->have_last = 1;
 
-        if (d->have_last) {
-            uint64_t ft = now - d->last_present_ns;   // 這個 frame 的 frametime
+    if (g_shm) {
+        if (!d->measuring) {
+            // Idle: start a window only when the reader asks for one.
+            if (atomic_load_explicit(&g_shm->request, memory_order_acquire) == 1) {
+                d->measuring = 1;
+                reset_window(d, now);
+            }
+        } else if (have_last) {
+            uint64_t ft = now - last;
             if (ft < d->min_ft_ns) d->min_ft_ns = ft;
             if (ft > d->max_ft_ns) d->max_ft_ns = ft;
             d->frame_count++;
-        } else {
-            // first frame: no previous timestamp to diff, just open the window
-            d->have_last = 1;
-            reset_window(d, now);
-        }
-        d->last_present_ns = now;
 
-        uint64_t elapsed = now - d->window_start_ns;
-        if (elapsed >= PUBLISH_INTERVAL_NS && d->frame_count > 0) {
-            double secs = (double)elapsed / 1e9;
-            double fps  = (double)d->frame_count / secs;
-            publish_stats(fps,
-                          (double)d->min_ft_ns / 1e6,
-                          (double)d->max_ft_ns / 1e6,
-                          d->frame_count, now);
-            reset_window(d, now);
+            uint64_t elapsed = now - d->window_start_ns;
+            if (elapsed >= MEASURE_WINDOW_NS && d->frame_count > 0) {
+                double fps = (double)d->frame_count / ((double)elapsed / 1e9);
+                write_result(fps,
+                             (double)d->min_ft_ns / 1e6,
+                             (double)d->max_ft_ns / 1e6,
+                             d->frame_count);
+                d->measuring = 0;
+            }
         }
     }
 
