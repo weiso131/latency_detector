@@ -8,7 +8,7 @@
 //
 // Ref: https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md
 
-#define _POSIX_C_SOURCE 200809L
+#define _GNU_SOURCE           // syscall(), clock_gettime, CLOCK_MONOTONIC
 
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
@@ -22,8 +22,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
 
 #include "fps_shm.h"
+
+// How long to accumulate before publishing one snapshot.
+#define PUBLISH_INTERVAL_NS 1000000000ull
 
 // ---------------------------------------------------------------------------
 // 每個 device 一份的狀態：下一層函式指標 + frametime 統計
@@ -112,6 +117,12 @@ static void ipc_init(void) {
         g_verbose = fopen(vpath, "a");
 }
 
+// Wake any reader waiting via FUTEX_WAIT on the seq word. Cheap (no-op) when
+// there is no waiter, so the writer never blocks.
+static void futex_wake_seq(void) {
+    syscall(SYS_futex, &g_shm->seq, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+}
+
 static void publish_stats(double fps, double min_ms, double max_ms,
                           uint64_t frames, uint64_t now) {
     if (g_shm) {
@@ -127,6 +138,8 @@ static void publish_stats(double fps, double min_ms, double max_ms,
 
         atomic_thread_fence(memory_order_release);
         atomic_store_explicit(&g_shm->seq, s + 2, memory_order_relaxed);
+
+        futex_wake_seq();
     }
 
     if (g_verbose) {
@@ -157,15 +170,14 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
             if (ft > d->max_ft_ns) d->max_ft_ns = ft;
             d->frame_count++;
         } else {
-            // 第一個 frame 沒有前一次可比，只記時間戳、開視窗
+            // first frame: no previous timestamp to diff, just open the window
             d->have_last = 1;
             reset_window(d, now);
         }
         d->last_present_ns = now;
 
-        // publish once per second
         uint64_t elapsed = now - d->window_start_ns;
-        if (elapsed >= 1000000000ull && d->frame_count > 0) {
+        if (elapsed >= PUBLISH_INTERVAL_NS && d->frame_count > 0) {
             double secs = (double)elapsed / 1e9;
             double fps  = (double)d->frame_count / secs;
             publish_stats(fps,

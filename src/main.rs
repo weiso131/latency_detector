@@ -1,19 +1,19 @@
 // Reader side of the fps/frametime IPC buffer written by the Vulkan layer.
 //
-// Opens the POSIX shared memory (default /game_fps), mmaps it, and polls the
-// seqlock for the latest snapshot. Sleeps between polls to keep CPU near zero.
+// Opens the POSIX shared memory (default /game_fps), mmaps it, and blocks on a
+// FUTEX_WAIT on the seqlock's `seq` word. The writer does FUTEX_WAKE after each
+// publish, so the reader consumes ~0 CPU while idle and wakes on new data. The
+// wait has a timeout so we can still detect a writer that stopped (stale).
 //
 // Layout mirrors game_fps/fps_shm.h -- both sides must agree on this struct.
 //
 // Env:
 //   LATENCY_SHM_NAME   shm name (default "/game_fps")
-//   READER_POLL_MS     poll interval in ms (default 500)
-//   READER_STALE_MS    treat data older than this as no-writer (default 2000)
+//   READER_STALE_MS    treat data older than this as no-writer, and the futex
+//                      wait timeout (default 2000)
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
-use std::thread::sleep;
-use std::time::Duration;
 
 // Must match FpsShm in game_fps/fps_shm.h.
 #[repr(C)]
@@ -72,8 +72,9 @@ fn map_shm(name: &str) -> Result<*const FpsShm, String> {
     Ok(p as *const FpsShm)
 }
 
-/// seqlock read: retry until we get a stable (even, unchanged) snapshot.
-fn read_snapshot(shm: &FpsShm) -> Snapshot {
+/// seqlock read: retry until stable. Returns the seq value the snapshot was
+/// taken at (even), so the caller can FUTEX_WAIT for it to change.
+fn read_snapshot(shm: &FpsShm) -> (u32, Snapshot) {
     loop {
         let s1 = shm.seq.load(Ordering::Acquire);
         if s1 & 1 != 0 {
@@ -93,15 +94,35 @@ fn read_snapshot(shm: &FpsShm) -> Snapshot {
         fence(Ordering::Acquire);
         let s2 = shm.seq.load(Ordering::Acquire);
         if s1 == s2 {
-            return snap;
+            return (s1, snap);
         }
     }
 }
 
+/// Block until seq differs from `expected`, or the timeout elapses.
+/// Returns immediately if it already differs.
+fn futex_wait(seq: &AtomicU32, expected: u32, timeout_ms: u64) {
+    let ts = libc::timespec {
+        tv_sec: (timeout_ms / 1000) as libc::time_t,
+        tv_nsec: ((timeout_ms % 1000) * 1_000_000) as libc::c_long,
+    };
+    unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            seq as *const AtomicU32,
+            libc::FUTEX_WAIT,
+            expected,
+            &ts as *const libc::timespec,
+        );
+    }
+    // Ignore the return value: EAGAIN (value already changed), ETIMEDOUT, and
+    // spurious wakeups all just mean "re-read the snapshot".
+}
+
 fn main() {
     let name = env_str("LATENCY_SHM_NAME", "/game_fps");
-    let poll = Duration::from_millis(env_u64("READER_POLL_MS", 500));
-    let stale_ns = env_u64("READER_STALE_MS", 2000) * 1_000_000;
+    let stale_ms = env_u64("READER_STALE_MS", 2000);
+    let stale_ns = stale_ms * 1_000_000;
 
     let shm_ptr = match map_shm(&name) {
         Ok(p) => p,
@@ -112,11 +133,11 @@ fn main() {
     };
     let shm = unsafe { &*shm_ptr };
 
-    eprintln!("fps_reader: reading {name}, poll={}ms", poll.as_millis());
+    eprintln!("fps_reader: reading {name} (futex, stale={stale_ms}ms)");
 
     let mut last_update = 0u64;
     loop {
-        let snap = read_snapshot(shm);
+        let (seq, snap) = read_snapshot(shm);
 
         if snap.update_ns == 0 {
             // never written yet
@@ -132,6 +153,8 @@ fn main() {
             last_update = snap.update_ns;
         }
 
-        sleep(poll);
+        // Sleep until the writer publishes (seq changes) or the stale timeout
+        // fires, so we can still report a writer that went away.
+        futex_wait(&shm.seq, seq, stale_ms);
     }
 }
