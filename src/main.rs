@@ -2,15 +2,16 @@
 //
 // Opens the POSIX shared memory (default /game_fps), mmaps it, and blocks on a
 // FUTEX_WAIT on the seqlock's `seq` word. The writer does FUTEX_WAKE after each
-// publish, so the reader consumes ~0 CPU while idle and wakes on new data. The
-// wait has a timeout so we can still detect a writer that stopped (stale).
+// publish, so the reader wakes only on new data and stays parked at ~0 CPU
+// while no game is running (no timeout -> no writer means no wakeups).
+//
+// The seqlock read still guards against a torn read; with 1s-aligned publishing
+// a race is not expected, so it doubles as a data-loss hint if it ever trips.
 //
 // Layout mirrors game_fps/fps_shm.h -- both sides must agree on this struct.
 //
 // Env:
 //   LATENCY_SHM_NAME   shm name (default "/game_fps")
-//   READER_STALE_MS    treat data older than this as no-writer, and the futex
-//                      wait timeout (default 2000)
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
@@ -33,21 +34,10 @@ struct Snapshot {
     min_frametime_ms: f64,
     max_frametime_ms: f64,
     frame_count: u64,
-    update_ns: u64,
 }
 
 fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
-}
-
-fn now_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
-    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 /// Map the shm read-only. Returns a pointer to the shared struct.
@@ -88,7 +78,6 @@ fn read_snapshot(shm: &FpsShm) -> (u32, Snapshot) {
                 min_frametime_ms: std::ptr::read_volatile(&shm.min_frametime_ms),
                 max_frametime_ms: std::ptr::read_volatile(&shm.max_frametime_ms),
                 frame_count: std::ptr::read_volatile(&shm.frame_count),
-                update_ns: std::ptr::read_volatile(&shm.update_ns),
             }
         };
         fence(Ordering::Acquire);
@@ -96,33 +85,30 @@ fn read_snapshot(shm: &FpsShm) -> (u32, Snapshot) {
         if s1 == s2 {
             return (s1, snap);
         }
+        // We read while the writer was mid-publish. With 1s-aligned publishing
+        // this should never happen; if it does, flag it as a data-loss hint.
+        eprintln!("fps_reader: warning: read raced the writer (retrying)");
     }
 }
 
-/// Block until seq differs from `expected`, or the timeout elapses.
-/// Returns immediately if it already differs.
-fn futex_wait(seq: &AtomicU32, expected: u32, timeout_ms: u64) {
-    let ts = libc::timespec {
-        tv_sec: (timeout_ms / 1000) as libc::time_t,
-        tv_nsec: ((timeout_ms % 1000) * 1_000_000) as libc::c_long,
-    };
+/// Block until seq differs from `expected`. No timeout: if no writer ever wakes
+/// us (no game running), we stay asleep forever at ~0 CPU.
+fn futex_wait(seq: &AtomicU32, expected: u32) {
     unsafe {
         libc::syscall(
             libc::SYS_futex,
             seq as *const AtomicU32,
             libc::FUTEX_WAIT,
             expected,
-            &ts as *const libc::timespec,
+            std::ptr::null::<libc::timespec>(),
         );
     }
-    // Ignore the return value: EAGAIN (value already changed), ETIMEDOUT, and
-    // spurious wakeups all just mean "re-read the snapshot".
+    // Ignore the return value: EAGAIN (value already changed) and spurious
+    // wakeups both just mean "re-read the snapshot".
 }
 
 fn main() {
     let name = env_str("LATENCY_SHM_NAME", "/game_fps");
-    let stale_ms = env_u64("READER_STALE_MS", 2000);
-    let stale_ns = stale_ms * 1_000_000;
 
     let shm_ptr = match map_shm(&name) {
         Ok(p) => p,
@@ -133,28 +119,18 @@ fn main() {
     };
     let shm = unsafe { &*shm_ptr };
 
-    eprintln!("fps_reader: reading {name} (futex, stale={stale_ms}ms)");
+    eprintln!("fps_reader: reading {name} (futex, blocking)");
 
-    let mut last_update = 0u64;
+    // Wait-first: block until the writer publishes, then read. With no writer
+    // we stay parked here forever -- no timeout, no spurious prints.
     loop {
-        let (seq, snap) = read_snapshot(shm);
+        let seq = shm.seq.load(Ordering::Acquire);
+        futex_wait(&shm.seq, seq);
 
-        if snap.update_ns == 0 {
-            // never written yet
-            println!("waiting for writer...");
-        } else if now_ns().saturating_sub(snap.update_ns) > stale_ns {
-            println!("stale (no writer): last fps={:.1}", snap.fps);
-        } else if snap.update_ns != last_update {
-            // only print on a fresh update
-            println!(
-                "fps={:.1}  min={:.3} ms  max={:.3} ms  (frames={})",
-                snap.fps, snap.min_frametime_ms, snap.max_frametime_ms, snap.frame_count
-            );
-            last_update = snap.update_ns;
-        }
-
-        // Sleep until the writer publishes (seq changes) or the stale timeout
-        // fires, so we can still report a writer that went away.
-        futex_wait(&shm.seq, seq, stale_ms);
+        let (_, snap) = read_snapshot(shm);
+        println!(
+            "fps={:.1}  min={:.3} ms  max={:.3} ms  (frames={})",
+            snap.fps, snap.min_frametime_ms, snap.max_frametime_ms, snap.frame_count
+        );
     }
 }
