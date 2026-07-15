@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <stdatomic.h>
 #include <fcntl.h>
@@ -94,9 +95,10 @@ static void ipc_init(void) {
     if (!name || !*name)
         name = FPS_SHM_DEFAULT_NAME;
 
-    int fd = shm_open(name, O_CREAT | O_RDWR, 0644);
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
         return;
+    fchmod(fd, 0666);
     if (ftruncate(fd, sizeof(FpsShm)) != 0) {
         close(fd);
         return;
