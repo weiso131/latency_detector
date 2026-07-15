@@ -44,7 +44,7 @@ fn env_str(key: &str, default: &str) -> String {
 /// valid for the process lifetime (never unmapped here).
 fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
     let cname = CString::new(name).map_err(|e| e.to_string())?;
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644) };
+    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666) };
     if fd < 0 {
         return Err(format!("shm_open({name}) failed: {}", std::io::Error::last_os_error()));
     }
@@ -54,6 +54,7 @@ fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
         unsafe { libc::close(fd) };
         return Err(format!("ftruncate failed: {}", std::io::Error::last_os_error()));
     }
+    unsafe { libc::fchmod(fd, 0o666) };
     let p = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
