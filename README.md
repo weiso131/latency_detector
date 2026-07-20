@@ -48,20 +48,21 @@ cd game_fps && ./build.sh          # 產出 liblatency_layer.so
 
 ## 在 Steam 使用
 
-在遊戲的 **內容 → 一般 → 啟動選項** 填入（`%command%` 一定要留在最後）：
+在遊戲的 **內容 → 一般 → 啟動選項** 填入（`%command%` 一定要留在最後）。
+把 `/path/to/latency_creater` 換成你 clone 專案的**絕對路徑**（Steam 不吃相對路徑）：
 
 ```
-VK_LAYER_PATH=/home/weiso/D/src/weiso131/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater %command%
+VK_LAYER_PATH=/path/to/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater %command%
 ```
 
 - **原生 Linux 遊戲**：直接生效。
 - **Proton（Windows 遊戲）**：一樣這樣填。DXVK 把 D3D 轉 Vulkan，present 時 layer 仍攔得到；
-  路徑在 `/home` 下，Proton 容器預設看得到。
+  路徑放在 home 目錄下，Proton 容器預設看得到。
 
 想同時看每秒文字輸出，前面再加 `LATENCY_VERBOSE`（寫到檔案，不是 stdout）：
 
 ```
-VK_LAYER_PATH=/home/weiso/D/src/weiso131/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater LATENCY_VERBOSE=/tmp/latency.log %command%
+VK_LAYER_PATH=/path/to/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater LATENCY_VERBOSE=/tmp/latency.log %command%
 ```
 
 > 非 Steam 的一般執行方式（含 `run.sh`）見 [`game_fps/README.md`](./game_fps/README.md)。
