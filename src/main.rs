@@ -39,15 +39,39 @@ fn env_str(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
-/// Map the shm read-write (we set the request flag). Uses O_CREAT so either
-/// side may start first: whoever opens it first creates it. The mapping stays
-/// valid for the process lifetime (never unmapped here).
+/// Open the shm object, tolerating either side starting first.
+fn open_shm_fd(cname: &CString) -> Result<i32, String> {
+    loop {
+        // Try to open an existing object without O_CREAT.
+        let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR, 0o666) };
+        if fd >= 0 {
+            return Ok(fd);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENOENT) {
+            return Err(format!("shm_open failed: {err}"));
+        }
+        // Doesn't exist yet: try to create it exclusively.
+        let fd =
+            unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o666) };
+        if fd >= 0 {
+            return Ok(fd);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            // Someone created it between our open and create: reopen it.
+            continue;
+        }
+        return Err(format!("shm_open (create) failed: {err}"));
+    }
+}
+
+/// Map the shm read-write (we set the request flag). Either side may start
+/// first: whoever opens it first creates it (see `open_shm_fd`). The mapping
+/// stays valid for the process lifetime (never unmapped here).
 fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
     let cname = CString::new(name).map_err(|e| e.to_string())?;
-    let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o666) };
-    if fd < 0 {
-        return Err(format!("shm_open({name}) failed: {}", std::io::Error::last_os_error()));
-    }
+    let fd = open_shm_fd(&cname).map_err(|e| format!("{e} ({name})"))?;
     let size = std::mem::size_of::<FpsShm>();
     // Size the object; harmless if it already exists at this size.
     if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
