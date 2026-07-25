@@ -1,98 +1,114 @@
-# latency_creater
+# latency_detector
 
-量遊戲 frametime / fps，透過共享記憶體傳給另一端做後續分析（之後配 bpf）。
+*[中文版](./README.zh-TW.md)*
 
-兩個部分：
+Measures game frametime / fps and hands the numbers to another process over
+shared memory for further analysis (bpf integration comes later).
 
-| 位置 | 是什麼 |
-|------|--------|
-| 專案根目錄（`src/`, `Cargo.toml`） | **主功能：讀取端（Rust）**。mmap 共享記憶體，輪詢讀最新快照，兩次輪詢間睡覺，CPU 幾乎不佔。 |
-| [`game_fps/`](./game_fps) | Vulkan Layer（C）。攔 `vkQueuePresentKHR` 量 frametime，每秒用 seqlock 把 fps/min/max 寫進 POSIX 共享記憶體 `/dev/shm/game_fps`。 |
+Two parts:
 
-共享記憶體的路徑與 struct layout 定義在 [`game_fps/fps_shm.h`](./game_fps/fps_shm.h)，兩端共用。
+| Location | What it is |
+|----------|------------|
+| Project root (`src/`, `Cargo.toml`) | **Main feature: the reader (Rust).** mmaps the shared memory, issues a request, then parks on a futex waiting for the result — almost no CPU. |
+| [`game_fps/`](./game_fps) | Vulkan layer (C). Hooks `vkQueuePresentKHR` to measure frametime; only on request does it measure a window and write fps/min/max into the POSIX shared memory `/dev/shm/game_fps`. |
+
+The shared-memory path and struct layout live in
+[`game_fps/fps_shm.h`](./game_fps/fps_shm.h), shared by both sides.
+The two sides speak a **request/response protocol**: the reader asks for a
+measurement of N seconds, and the layer replies with one result after measuring
+a window that long. See
+[`game_fps/README.md`](./game_fps/README.md#requestresponse-protocol) for details.
 
 ---
 
-## 環境需求
+## Requirements
 
-| 項目 | 說明 |
-|------|------|
-| Vulkan Loader (runtime) | `libvulkan.so.1`，跑 Vulkan 程式本來就需要 |
-| Vulkan headers（build layer 用） | 提供 `vulkan/vulkan.h`、`vulkan/vk_layer.h` |
-| C 編譯器 | `gcc`（`-std=gnu11`） |
-| Rust toolchain | `cargo`（build reader 用） |
-| 測試程式（選用） | `vkcube`（Fedora 在 `vulkan-tools`） |
+| Item | Notes |
+|------|-------|
+| Vulkan loader (runtime) | `libvulkan.so.1`; already needed to run any Vulkan program |
+| Vulkan headers (to build the layer) | Provides `vulkan/vulkan.h` and `vulkan/vk_layer.h` |
+| C compiler | `gcc` (`-std=gnu11`) |
+| Rust toolchain | `cargo` (to build the reader) |
+| Test program (optional) | `vkcube` (in `vulkan-tools` on Fedora) |
 
-### Fedora 安裝相依套件
+### Installing dependencies on Fedora
 
 ```bash
 sudo dnf install -y vulkan-headers vulkan-loader-devel vulkan-tools
 ```
 
-> 其他發行版套件名可能不同（Debian/Ubuntu：`libvulkan-dev vulkan-tools`；
-> Arch：`vulkan-headers vulkan-tools`）。Rust 用 [rustup](https://rustup.rs) 裝。
+> Package names differ across distros (Debian/Ubuntu: `libvulkan-dev vulkan-tools`;
+> Arch: `vulkan-headers vulkan-tools`). Install Rust via [rustup](https://rustup.rs).
 
 ---
 
 ## Build
 
 ```bash
-# Reader（Rust，專案根目錄）
+# Reader (Rust, from the project root)
 cargo build --release
 
-# Layer（C）
-cd game_fps && ./build.sh          # 產出 liblatency_layer.so
+# Layer (C)
+cd game_fps && ./build.sh          # produces liblatency_layer.so
 ```
 
 ---
 
-## 在 Steam 使用
+## Using it with Steam
 
-在遊戲的 **內容 → 一般 → 啟動選項** 填入（`%command%` 一定要留在最後）。
-把 `/path/to/latency_creater` 換成你 clone 專案的**絕對路徑**（Steam 不吃相對路徑）：
+Set this in the game's **Properties → General → Launch Options** (`%command%`
+must stay at the end). Replace `/path/to/latency_creater` with the **absolute
+path** to your clone — Steam does not accept relative paths:
 
 ```
 VK_LAYER_PATH=/path/to/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater %command%
 ```
 
-- **原生 Linux 遊戲**：直接生效。
-- **Proton（Windows 遊戲）**：一樣這樣填。DXVK 把 D3D 轉 Vulkan，present 時 layer 仍攔得到；
-  路徑放在 home 目錄下，Proton 容器預設看得到。
+- **Native Linux games**: works directly.
+- **Proton (Windows games)**: same line. DXVK translates D3D to Vulkan, so the
+  layer still intercepts the presents; keep the path under your home directory,
+  which the Proton container can see by default.
 
-想同時看每秒文字輸出，前面再加 `LATENCY_VERBOSE`（寫到檔案，不是 stdout）：
+To also get text output from the layer, add `LATENCY_VERBOSE` (it writes to a
+file, not stdout):
 
 ```
 VK_LAYER_PATH=/path/to/latency_creater/game_fps VK_LOADER_LAYERS_ENABLE=VK_LAYER_latency_creater LATENCY_VERBOSE=/tmp/latency.log %command%
 ```
 
-> 非 Steam 的一般執行方式（含 `run.sh`）見 [`game_fps/README.md`](./game_fps/README.md)。
+> For running outside Steam (including `run.sh`), see
+> [`game_fps/README.md`](./game_fps/README.md).
 
 ---
 
-## 讀取 fps（reader）
+## Reading the fps (reader)
 
-遊戲跑起來後，另開一個終端跑 reader：
+With the game running, start the reader in another terminal:
 
 ```bash
 cargo run --release
 ```
 
-會每秒印出目前的 fps / min / max。有印出數字就代表整條鏈在遊戲裡通了。
-也可用 `watch -n1 ls -l /dev/shm/game_fps` 確認共享記憶體有被建立、更新。
+The reader issues a request and prints one fps / min / max line once the layer
+has measured a window. Seeing numbers means the whole chain works inside the
+game. You can also run `ls -l /dev/shm/game_fps` to confirm the shared memory
+was created.
 
-reader 支援的環境變數：
+Environment variables the reader understands:
 
-| 變數 | 預設 | 作用 |
-|------|------|------|
-| `LATENCY_SHM_NAME` | `/game_fps` | 共享記憶體名稱（要跟 layer 端一致） |
-| `READER_POLL_MS` | `500` | 輪詢間隔（ms）。越大越省 CPU、越不即時。 |
-| `READER_STALE_MS` | `2000` | 資料超過這麼久沒更新就當作「沒有寫端」 |
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LATENCY_SHM_NAME` | `/game_fps` | Shared-memory name (must match the layer's) |
+| `LATENCY_WINDOW_SEC` | `1` | How many seconds each request measures. Must be > 0 (`0` means idle in the protocol). Larger is smoother but reports less often. |
 
 ---
 
-## 疑難排解
+## Troubleshooting
 
-- **reader 印 `waiting for writer...`**：shm 已建但 layer 還沒寫第一筆；遊戲開始 present 後就會有數字。
-- **reader 印 `stale (no writer)`**：遊戲關了 / 沒在 present。共享記憶體會留住最後一筆值。
-- **完全沒反應 / layer 沒載入**：加 `VK_LOADER_DEBUG=all` 跑，看有沒有
-  `Found manifest file .../latency_layer.json`。詳見 [`game_fps/README.md`](./game_fps/README.md) 的疑難排解。
+- **The reader sits there printing nothing**: expected. With no game presenting,
+  nobody answers the request and the reader stays in `FUTEX_WAIT` (no CPU cost).
+  Numbers appear once the game starts presenting. The first one takes at least
+  `LATENCY_WINDOW_SEC` seconds.
+- **Nothing happens at all / the layer never loads**: run with
+  `VK_LOADER_DEBUG=all` and look for `Found manifest file .../latency_layer.json`.
+  See the troubleshooting section in [`game_fps/README.md`](./game_fps/README.md).

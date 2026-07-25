@@ -1,47 +1,88 @@
 # game_fps — Vulkan Layer
 
-攔截 `vkQueuePresentKHR` 量 frametime，每秒用 seqlock 把 fps/min/max 寫進
-POSIX 共享記憶體 `/dev/shm/game_fps`。共享路徑與 struct 定義見 [`fps_shm.h`](./fps_shm.h)。
+*[中文版](./README.zh-TW.md)*
 
-> 專案總覽、環境需求、build、**在 Steam 使用**、reader 都在
-> 上層的 [`../README.md`](../README.md)。這份只講本目錄怎麼直接跑 + 環境變數。
+Hooks `vkQueuePresentKHR` to measure frametime. It measures a window only
+**when the reader requests one**, and writes the result into the POSIX shared
+memory `/dev/shm/game_fps`. The shared path and struct definition live in
+[`fps_shm.h`](./fps_shm.h).
+
+> The project overview, requirements, build steps, **using it with Steam**, and
+> the reader are all in [`../README.md`](../README.md) one level up. This file
+> only covers running things from this directory plus the environment variables.
 
 ---
 
-## 直接執行（非 Steam）
+## request/response protocol
 
-`run.sh` 會設好 layer 相關環境變數，然後執行你指定的 Vulkan 程式：
+`request_sec` in the shared memory is the **only synchronization point**, and it
+doubles as the futex word for both sides. It carries the request and the
+request's parameter in a single value:
+
+| `request_sec` | Meaning |
+|---------------|---------|
+| `0` | Idle, or "result ready" |
+| `N > 0` | The reader wants a window **N seconds** long |
+
+The flow:
+
+1. The reader stores the window length `N` into `request_sec`, `FUTEX_WAKE`s the
+   layer, then `FUTEX_WAIT`s for the value to leave `N`.
+2. On the next present the layer sees a nonzero value and opens a window, and
+   starts accumulating frametimes.
+3. After `N` seconds it writes fps/min/max/frame_count, stores `0` back into
+   `request_sec` (store-release), and wakes the reader.
+4. The layer will not touch this memory again until the reader issues a new
+   request.
+
+Because the layer only writes during the `N -> 0` transition and will not write
+again until the reader re-arms, the reader owns the buffer exclusively while
+reading it — **no seqlock needed**.
+
+`0` is not a valid window length (it already means idle/ready), so the reader
+rejects it. While no game is running the layer never clears `request_sec`, so
+the reader simply stays parked in `FUTEX_WAIT` at almost no CPU cost.
+
+The window length is chosen by the **reader**; see `LATENCY_WINDOW_SEC` in
+[`../README.md`](../README.md).
+
+---
+
+## Running it directly (without Steam)
+
+`run.sh` sets up the layer's environment variables and then runs the Vulkan
+program you name:
 
 ```bash
-./run.sh vkcube            # 或任何 Vulkan 程式
+./run.sh vkcube            # or any Vulkan program
 ```
 
-或手動設環境變數：
+Or set the variables yourself:
 
 ```bash
-export VK_LAYER_PATH="$(pwd)"                              # 找 latency_layer.json
-export VK_LOADER_LAYERS_ENABLE="VK_LAYER_latency_creater"  # 啟用本 layer
+export VK_LAYER_PATH="$(pwd)"                              # where latency_layer.json is
+export VK_LOADER_LAYERS_ENABLE="VK_LAYER_latency_creater"  # enable this layer
 vkcube
 ```
 
 ---
 
-## 環境變數
+## Environment variables
 
-| 變數 | 預設 | 作用 |
-|------|------|------|
-| `LATENCY_SHM_NAME` | `/game_fps` | 共享記憶體名稱（對應 `/dev/shm/<name>`）。讀端要用同一個名稱。 |
-| `LATENCY_VERBOSE` | （未設） | **設了才輸出文字**：把每秒統計 append 到這個檔案路徑。沒設就只寫 shm。 |
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `LATENCY_SHM_NAME` | `/game_fps` | Shared-memory name (maps to `/dev/shm/<name>`). The reader must use the same name. |
+| `LATENCY_VERBOSE` | (unset) | **Text output only when set**: appends one line to this file path every time a window is measured. Unset means shm only. |
 
-verbose 想即時看：
+To follow the verbose output live:
 
 ```bash
 export LATENCY_VERBOSE=/tmp/latency.log
 ./run.sh vkcube
-tail -f /tmp/latency.log      # 另一個終端
+tail -f /tmp/latency.log      # in another terminal
 ```
 
-輸出每秒一行（append，不是 stdout）：
+One line per window (appended, not stdout):
 
 ```
 [latency] fps=59.9  min_frametime=4.506 ms  max_frametime=29.701 ms  (frames=60)
@@ -49,22 +90,26 @@ tail -f /tmp/latency.log      # 另一個終端
 
 ---
 
-## 檔案
+## Files
 
-| 檔案 | 作用 |
-|------|------|
-| `latency_layer.c` | Layer 本體，攔截 `vkQueuePresentKHR` 量 frametime，寫 shm |
-| `fps_shm.h` | 共享記憶體路徑與 struct 定義（寫端 / 讀端共用） |
-| `latency_layer.json` | Layer manifest，讓 Vulkan loader 找到 `.so` |
-| `build.sh` | 編譯腳本 |
-| `run.sh` | 設好環境變數並執行 Vulkan 程式 |
+| File | Purpose |
+|------|---------|
+| `latency_layer.c` | The layer itself: hooks `vkQueuePresentKHR`, measures frametime, writes shm |
+| `fps_shm.h` | Shared-memory path, struct definition, and the request/response protocol (shared by writer and reader) |
+| `latency_layer.json` | Layer manifest, so the Vulkan loader can find the `.so` |
+| `build.sh` | Build script |
+| `run.sh` | Sets the environment variables and runs a Vulkan program |
 
 ---
 
-## 疑難排解
+## Troubleshooting
 
-- **沒有任何 verbose 輸出**：確認程式真的有 present（會開視窗畫東西）；並確認有設 `LATENCY_VERBOSE`。
-  可加 `VK_LOADER_DEBUG=all` 看 loader 有沒有載入 `Found manifest file .../latency_layer.json`。
-- **程式崩潰 / segfault**：確認 `liblatency_layer.so` 是最新編出來的（重跑 `./build.sh`）。
-- **`clock_gettime` 編譯錯誤**：原始碼開頭已 `#define _POSIX_C_SOURCE 200809L`；
-  若自行改 build flag 請保留 `-std=gnu11` 或加該 macro。
+- **No verbose output at all**: check the program really presents (it opens a
+  window and draws something), and that `LATENCY_VERBOSE` is set. You can add
+  `VK_LOADER_DEBUG=all` to see whether the loader picked it up
+  (`Found manifest file .../latency_layer.json`).
+- **Crash / segfault**: make sure `liblatency_layer.so` is freshly built (re-run
+  `./build.sh`).
+- **`clock_gettime` compile error**: the source already starts with
+  `#define _POSIX_C_SOURCE 200809L`; if you change the build flags yourself,
+  keep `-std=gnu11` or add that macro.
