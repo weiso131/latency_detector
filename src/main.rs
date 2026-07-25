@@ -1,17 +1,22 @@
 // Reader side of the fps/frametime IPC buffer written by the Vulkan layer.
 //
-// Reader-driven: we set `request = 1`, wake the layer, and block on
-// FUTEX_WAIT(request == 1). The layer measures one window, writes the fields,
-// sets request = 0, and wakes us. Because the layer won't write again until we
-// re-arm, we own the buffer while reading -- no seqlock needed.
+// Reader-driven: we store the window length in `request_sec`, wake the layer,
+// and block on FUTEX_WAIT until that word leaves the value we wrote. The layer
+// measures a window of that length, writes the fields, sets request_sec = 0,
+// and wakes us. Because the layer won't write again until we re-arm, we own the
+// buffer while reading -- no seqlock needed.
 //
-// While no game is running the layer never clears request, so we simply stay
-// parked in FUTEX_WAIT at ~0 CPU.
+// The word carries both the request and its parameter: nonzero = "measure this
+// many seconds", 0 = idle / result ready.
+//
+// While no game is running the layer never clears request_sec, so we simply
+// stay parked in FUTEX_WAIT at ~0 CPU.
 //
 // Layout mirrors game_fps/fps_shm.h -- both sides must agree on this struct.
 //
 // Env:
 //   LATENCY_SHM_NAME   shm name (default "/game_fps")
+//   LATENCY_WINDOW_SEC measurement window in seconds (default 1, must be > 0)
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -19,7 +24,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // Must match FpsShm in game_fps/fps_shm.h.
 #[repr(C)]
 struct FpsShm {
-    request: AtomicU32, // 1 = sample requested, 0 = idle / result ready
+    request_sec: AtomicU32, // >0 = window length in seconds, 0 = idle / result ready
     _pad: u32,
     fps: f64,
     min_frametime_ms: f64,
@@ -97,7 +102,7 @@ fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
 }
 
 /// Read the result fields. Safe to read plainly: the handshake guarantees the
-/// layer is not writing while request == 0.
+/// layer is not writing while request_sec == 0.
 fn read_result(shm: &FpsShm) -> Snapshot {
     Snapshot {
         fps: shm.fps,
@@ -108,7 +113,7 @@ fn read_result(shm: &FpsShm) -> Snapshot {
 }
 
 /// Block while `word` still equals `expected`. No timeout: if the layer never
-/// clears request (no game running), we stay parked at ~0 CPU.
+/// clears request_sec (no game running), we stay parked at ~0 CPU.
 fn futex_wait(word: &AtomicU32, expected: u32) {
     unsafe {
         libc::syscall(
@@ -119,11 +124,21 @@ fn futex_wait(word: &AtomicU32, expected: u32) {
             std::ptr::null::<libc::timespec>(),
         );
     }
-    // EAGAIN (already changed) and spurious wakeups just mean "re-check request".
+    // EAGAIN (already changed) and spurious wakeups just mean "re-check the word".
 }
 
 fn main() {
     let name = env_str("LATENCY_SHM_NAME", "/game_fps");
+
+    // 0 would collide with the idle / result-ready state, so it is not a valid
+    // window length.
+    let window_sec: u32 = match env_str("LATENCY_WINDOW_SEC", "1").parse() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            eprintln!("fps_reader: LATENCY_WINDOW_SEC must be a positive integer");
+            std::process::exit(1);
+        }
+    };
 
     let shm_ptr = match map_shm(&name) {
         Ok(p) => p,
@@ -134,15 +149,15 @@ fn main() {
     };
     let shm = unsafe { &*shm_ptr };
 
-    eprintln!("fps_reader: reading {name} (request/response)");
+    eprintln!("fps_reader: reading {name} (request/response, {window_sec}s window)");
 
     loop {
-        // Arm a request and wake the layer.
-        shm.request.store(1, Ordering::Release);
+        // Arm a request for a window of `window_sec` seconds and wake the layer.
+        shm.request_sec.store(window_sec, Ordering::Release);
 
-        // Wait until the layer measures a window and clears request back to 0.
-        while shm.request.load(Ordering::Acquire) == 1 {
-            futex_wait(&shm.request, 1);
+        // Wait until the layer measures the window and clears the word back to 0.
+        while shm.request_sec.load(Ordering::Acquire) == window_sec {
+            futex_wait(&shm.request_sec, window_sec);
         }
 
         let snap = read_result(shm);

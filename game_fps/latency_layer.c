@@ -28,9 +28,6 @@
 
 #include "fps_shm.h"
 
-// Length of one measurement window, once a sample has been requested.
-#define MEASURE_WINDOW_NS 1000000000ull
-
 // Per-device state: next-layer function pointers + measurement accumulators.
 typedef struct DeviceData {
     VkDevice device;
@@ -40,8 +37,7 @@ typedef struct DeviceData {
     int      have_last;        // seen a previous present (for frametime diff)
     uint64_t last_present_ns;  // timestamp of the previous present
 
-    int      measuring;        // 1 while accumulating a requested window
-    uint64_t window_start_ns;
+    uint64_t window_start_ns;  // 0 = no window open; otherwise the window's start
     uint64_t frame_count;
     uint64_t min_ft_ns;
     uint64_t max_ft_ns;
@@ -77,6 +73,7 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+// Opens a measurement window: a nonzero window_start_ns is what marks it open.
 static void reset_window(DeviceData *d, uint64_t now) {
     d->window_start_ns = now;
     d->frame_count = 0;
@@ -114,14 +111,14 @@ static void ipc_init(void) {
         g_verbose = fopen(vpath, "a");
 }
 
-// Wake the reader parked on FUTEX_WAIT(request). No-op if none is waiting.
+// Wake the reader parked on FUTEX_WAIT(request_sec). No-op if none is waiting.
 static void futex_wake_request(void) {
-    syscall(SYS_futex, &g_shm->request, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+    syscall(SYS_futex, &g_shm->request_sec, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
 }
 
-// Write one result, then release it: request = 0 marks "result ready" and, per
-// the handshake, guarantees we won't touch the buffer again until the reader
-// re-arms. The store-release publishes the field writes before request drops.
+// Write one result, then release it: request_sec = 0 marks "result ready" and,
+// per the handshake, guarantees we won't touch the buffer again until the reader
+// re-arms. The store-release publishes the field writes before the word drops.
 static void write_result(double fps, double min_ms, double max_ms,
                          uint64_t frames) {
     g_shm->fps = fps;
@@ -129,7 +126,7 @@ static void write_result(double fps, double min_ms, double max_ms,
     g_shm->max_frametime_ms = max_ms;
     g_shm->frame_count = frames;
 
-    atomic_store_explicit(&g_shm->request, 0, memory_order_release);
+    atomic_store_explicit(&g_shm->request_sec, 0, memory_order_release);
     futex_wake_request();
 
     if (g_verbose) {
@@ -140,8 +137,9 @@ static void write_result(double fps, double min_ms, double max_ms,
     }
 }
 
-// Intercepts each present. Only accumulates while the reader has requested a
-// sample (request == 1); otherwise it just tracks the last present time.
+// Intercepts each present. Only accumulates while a window is open, which
+// happens only after the reader asks for one (request_sec != 0); otherwise it
+// just tracks the last present time.
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     DeviceData *d = find_device_by_key(get_dispatch_key(queue));
@@ -155,12 +153,14 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     d->have_last = 1;
 
     if (g_shm) {
-        if (!d->measuring) {
-            // Idle: start a window only when the reader asks for one.
-            if (atomic_load_explicit(&g_shm->request, memory_order_acquire) == 1) {
-                d->measuring = 1;
+        // The request word is the only state: nonzero means a window of that
+        // many seconds is wanted. window_start_ns == 0 means we have not opened
+        // one yet.
+        uint32_t req = atomic_load_explicit(&g_shm->request_sec, memory_order_acquire);
+
+        if (d->window_start_ns == 0) {
+            if (req != 0)
                 reset_window(d, now);
-            }
         } else if (have_last) {
             uint64_t ft = now - last;
             if (ft < d->min_ft_ns) d->min_ft_ns = ft;
@@ -168,13 +168,13 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
             d->frame_count++;
 
             uint64_t elapsed = now - d->window_start_ns;
-            if (elapsed >= MEASURE_WINDOW_NS && d->frame_count > 0) {
+            if (elapsed >= (uint64_t)req * 1000000000ull && d->frame_count > 0) {
                 double fps = (double)d->frame_count / ((double)elapsed / 1e9);
                 write_result(fps,
                              (double)d->min_ft_ns / 1e6,
                              (double)d->max_ft_ns / 1e6,
                              d->frame_count);
-                d->measuring = 0;
+                d->window_start_ns = 0;
             }
         }
     }
