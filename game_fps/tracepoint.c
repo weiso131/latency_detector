@@ -25,7 +25,7 @@ void tp_bind(Tracepoint *tp, TidSlot *slots) {
 // Claim a slot for `tid`, or find the one we already own. Returns -1 if the
 // table is full or every free slot was taken from under us.
 static int claim_tid_slot(Tracepoint *tp, uint32_t tid) {
-    for (int i = 0; i < PRESENT_MAX_TIDS; i++) {
+    for (int i = 0; i < tp->n_slots; i++) {
         uint32_t owner = atomic_load_explicit(&tp->slots[i].tid,
                                               memory_order_acquire);
         if (owner == tid)
@@ -64,7 +64,7 @@ static void release_tid_slot(TidSlot *slot) {
 // that has exited; only the latter should give up its slot, so ask /proc which
 // it is. The check costs a stat, but only for silent slots.
 static void flush_tid_counts(Tracepoint *tp) {
-    for (int i = 0; i < PRESENT_MAX_TIDS; i++) {
+    for (int i = 0; i < tp->n_slots; i++) {
         uint32_t n = atomic_exchange_explicit(&tp->counts[i], 0,
                                               memory_order_acq_rel);
         TidSlot *slot = &tp->slots[i];

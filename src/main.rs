@@ -21,8 +21,9 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// Must match PRESENT_MAX_TIDS in game_fps/fps_shm.h.
+// Must match PRESENT_MAX_TIDS / SUBMIT_MAX_TIDS in game_fps/fps_shm.h.
 const PRESENT_MAX_TIDS: usize = 4;
+const SUBMIT_MAX_TIDS: usize = 32;
 
 // Must match TidSlot in game_fps/fps_shm.h.
 #[repr(C)]
@@ -42,6 +43,8 @@ struct FpsShm {
     frame_count: u64,
 
     present_tids: [TidSlot; PRESENT_MAX_TIDS],
+    // vkQueueSubmit and vkQueueSubmit2 both count here.
+    submit_tids: [TidSlot; SUBMIT_MAX_TIDS],
 }
 
 #[derive(Debug)]
@@ -124,15 +127,15 @@ fn read_result(shm: &FpsShm) -> Snapshot {
     }
 }
 
-/// Read the presenting-thread table. Independent of the handshake: every field
-/// is atomic and the layer maintains the table on every present, so this is a
-/// plain snapshot taken whenever we like.
+/// Read one of the per-thread call tables. Independent of the handshake: every
+/// field is atomic and the layer maintains the tables on every call, so this is
+/// a plain snapshot taken whenever we like.
 ///
 /// Scan the whole array rather than stopping at the first free slot: a thread
 /// that loses the claim CAS moves on to a later index, so an occupied slot can
 /// sit past a free one.
-fn read_present_tids(shm: &FpsShm) -> Vec<(u32, u32)> {
-    shm.present_tids
+fn read_tid_table(slots: &[TidSlot]) -> Vec<(u32, u32)> {
+    slots
         .iter()
         .map(|slot| {
             (
@@ -198,13 +201,18 @@ fn main() {
             snap.fps, snap.min_frametime_ms, snap.max_frametime_ms, snap.frame_count
         );
 
-        let tids = read_present_tids(shm);
-        if !tids.is_empty() {
-            let list: Vec<String> = tids
-                .iter()
-                .map(|(tid, max)| format!("{tid}(max {max}/s)"))
-                .collect();
-            println!("  present tids: {}", list.join("  "));
+        for (label, slots) in [
+            ("present", &shm.present_tids[..]),
+            ("submit", &shm.submit_tids[..]),
+        ] {
+            let tids = read_tid_table(slots);
+            if !tids.is_empty() {
+                let list: Vec<String> = tids
+                    .iter()
+                    .map(|(tid, max)| format!("{tid}(max {max}/s)"))
+                    .collect();
+                println!("  {label} tids: {}", list.join("  "));
+            }
         }
     }
 }

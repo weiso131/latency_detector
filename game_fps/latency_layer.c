@@ -35,6 +35,8 @@ typedef struct DeviceData {
     VkDevice device;
     PFN_vkGetDeviceProcAddr next_gdpa;
     PFN_vkQueuePresentKHR   next_present;
+    PFN_vkQueueSubmit       next_submit;
+    PFN_vkQueueSubmit2      next_submit2;   // NULL on pre-1.3 devices
 
     int      have_last;        // seen a previous present (for frametime diff)
     uint64_t last_present_ns;  // timestamp of the previous present
@@ -80,8 +82,10 @@ static void reset_window(DeviceData *d, uint64_t now) {
 static FpsShm *g_shm = NULL;   // NULL if shm setup failed -> writes are skipped
 static FILE   *g_verbose = NULL;
 
-// One tracepoint per intercepted entry point, bound to its shm array below.
-static Tracepoint g_present_tp = { .id = TP_PRESENT };
+// One tracepoint per kind of intercepted call, bound to its shm array below.
+// vkQueueSubmit and vkQueueSubmit2 both feed g_submit_tp.
+TRACEPOINT_DEFINE(g_present_tp, TP_PRESENT, PRESENT_MAX_TIDS);
+TRACEPOINT_DEFINE(g_submit_tp,  TP_SUBMIT,  SUBMIT_MAX_TIDS);
 
 static void ipc_init(void) {
     const char *name = getenv("LATENCY_SHM_NAME");
@@ -102,6 +106,7 @@ static void ipc_init(void) {
         return;
     g_shm = (FpsShm *)p;
     tp_bind(&g_present_tp, g_shm->present_tids);
+    tp_bind(&g_submit_tp, g_shm->submit_tids);
 
     const char *vpath = getenv("LATENCY_VERBOSE");
     if (vpath && *vpath)
@@ -132,6 +137,35 @@ static void write_result(double fps, double min_ms, double max_ms,
                 fps, min_ms, max_ms, (unsigned long long)frames);
         fflush(g_verbose);
     }
+}
+
+// Intercepts submits purely to record which threads make them -- no frametime
+// work here, so both entry points reduce to counting and forwarding. They share
+// one tracepoint: vkQueueSubmit2 is the newer spelling of the same operation.
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_QueueSubmit(VkQueue queue, uint32_t submitCount,
+                  const VkSubmitInfo *pSubmits, VkFence fence) {
+    DeviceData *d = find_device_by_key(get_dispatch_key(queue));
+    if (!d || !d->next_submit)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (g_shm)
+        tp_record(&g_submit_tp, now_ns());
+
+    return d->next_submit(queue, submitCount, pSubmits, fence);
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_QueueSubmit2(VkQueue queue, uint32_t submitCount,
+                   const VkSubmitInfo2 *pSubmits, VkFence fence) {
+    DeviceData *d = find_device_by_key(get_dispatch_key(queue));
+    if (!d || !d->next_submit2)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (g_shm)
+        tp_record(&g_submit_tp, now_ns());
+
+    return d->next_submit2(queue, submitCount, pSubmits, fence);
 }
 
 // Intercepts each present. Only accumulates while a window is open, which
@@ -190,8 +224,20 @@ layer_GetDeviceProcAddr(VkDevice device, const char *pName) {
         return (PFN_vkVoidFunction)layer_GetDeviceProcAddr;
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+    // Core since 1.0, so the next layer always has it.
+    if (strcmp(pName, "vkQueueSubmit") == 0)
+        return (PFN_vkVoidFunction)layer_QueueSubmit;
 
     DeviceData *d = find_device_by_key(get_dispatch_key(device));
+
+    // Only wrap Submit2 where the next layer actually provides it: handing back
+    // a wrapper for a call the device does not support would turn the app's
+    // NULL check into a function that always fails.
+    if (strcmp(pName, "vkQueueSubmit2") == 0 ||
+        strcmp(pName, "vkQueueSubmit2KHR") == 0)
+        return (d && d->next_submit2) ? (PFN_vkVoidFunction)layer_QueueSubmit2
+                                      : NULL;
+
     if (d && d->next_gdpa)
         return d->next_gdpa(device, pName);
     return NULL;
@@ -242,6 +288,17 @@ layer_CreateDevice(VkPhysicalDevice physicalDevice,
         d->next_gdpa = next_gdpa;
         d->next_present =
             (PFN_vkQueuePresentKHR)next_gdpa(*pDevice, "vkQueuePresentKHR");
+        d->next_submit =
+            (PFN_vkQueueSubmit)next_gdpa(*pDevice, "vkQueueSubmit");
+        // Core in 1.3; before that the same call ships as VK_KHR_synchronization2.
+        // The two names are equivalent and usually resolve to one implementation,
+        // but a device that only advertises the extension answers just the KHR
+        // spelling, so ask for it when the core name comes back empty.
+        d->next_submit2 =
+            (PFN_vkQueueSubmit2)next_gdpa(*pDevice, "vkQueueSubmit2");
+        if (!d->next_submit2)
+            d->next_submit2 =
+                (PFN_vkQueueSubmit2)next_gdpa(*pDevice, "vkQueueSubmit2KHR");
         d->min_ft_ns = UINT64_MAX;
         d->next = g_devices;
         g_devices = d;
@@ -296,6 +353,10 @@ static PFN_vkVoidFunction intercept(const char *pName) {
         return (PFN_vkVoidFunction)layer_CreateDevice;
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+    // Submit2 is deliberately absent: whether to wrap it depends on the device,
+    // which this path has no handle on. Apps resolve it via GetDeviceProcAddr.
+    if (strcmp(pName, "vkQueueSubmit") == 0)
+        return (PFN_vkVoidFunction)layer_QueueSubmit;
     return NULL;
 }
 
