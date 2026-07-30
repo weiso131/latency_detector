@@ -27,6 +27,8 @@
 #include <linux/futex.h>
 
 #include "fps_shm.h"
+#include "tracepoint.h"
+#include "helper.h"
 
 // Per-device state: next-layer function pointers + measurement accumulators.
 typedef struct DeviceData {
@@ -64,15 +66,6 @@ static DeviceData *find_device_by_key(void *key) {
     return NULL;
 }
 
-// ---------------------------------------------------------------------------
-// 計時
-// ---------------------------------------------------------------------------
-static uint64_t now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
 // Opens a measurement window: a nonzero window_start_ns is what marks it open.
 static void reset_window(DeviceData *d, uint64_t now) {
     d->window_start_ns = now;
@@ -86,6 +79,9 @@ static void reset_window(DeviceData *d, uint64_t now) {
 // ---------------------------------------------------------------------------
 static FpsShm *g_shm = NULL;   // NULL if shm setup failed -> writes are skipped
 static FILE   *g_verbose = NULL;
+
+// One tracepoint per intercepted entry point, bound to its shm array below.
+static Tracepoint g_present_tp = { .id = TP_PRESENT };
 
 static void ipc_init(void) {
     const char *name = getenv("LATENCY_SHM_NAME");
@@ -105,6 +101,7 @@ static void ipc_init(void) {
     if (p == MAP_FAILED)
         return;
     g_shm = (FpsShm *)p;
+    tp_bind(&g_present_tp, g_shm->present_tids);
 
     const char *vpath = getenv("LATENCY_VERBOSE");
     if (vpath && *vpath)
@@ -153,6 +150,8 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     d->have_last = 1;
 
     if (g_shm) {
+        tp_record(&g_present_tp, now);
+
         // The request word is the only state: nonzero means a window of that
         // many seconds is wanted. window_start_ns == 0 means we have not opened
         // one yet.

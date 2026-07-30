@@ -21,6 +21,16 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// Must match PRESENT_MAX_TIDS in game_fps/fps_shm.h.
+const PRESENT_MAX_TIDS: usize = 4;
+
+// Must match TidSlot in game_fps/fps_shm.h.
+#[repr(C)]
+struct TidSlot {
+    tid: AtomicU32,         // 0 = free slot, else the presenting kernel tid
+    max_per_sec: AtomicU32, // high-water mark of presents in any one second
+}
+
 // Must match FpsShm in game_fps/fps_shm.h.
 #[repr(C)]
 struct FpsShm {
@@ -30,6 +40,8 @@ struct FpsShm {
     min_frametime_ms: f64,
     max_frametime_ms: f64,
     frame_count: u64,
+
+    present_tids: [TidSlot; PRESENT_MAX_TIDS],
 }
 
 #[derive(Debug)]
@@ -112,6 +124,26 @@ fn read_result(shm: &FpsShm) -> Snapshot {
     }
 }
 
+/// Read the presenting-thread table. Independent of the handshake: every field
+/// is atomic and the layer maintains the table on every present, so this is a
+/// plain snapshot taken whenever we like.
+///
+/// Scan the whole array rather than stopping at the first free slot: a thread
+/// that loses the claim CAS moves on to a later index, so an occupied slot can
+/// sit past a free one.
+fn read_present_tids(shm: &FpsShm) -> Vec<(u32, u32)> {
+    shm.present_tids
+        .iter()
+        .map(|slot| {
+            (
+                slot.tid.load(Ordering::Acquire),
+                slot.max_per_sec.load(Ordering::Acquire),
+            )
+        })
+        .filter(|&(tid, _)| tid != 0)
+        .collect()
+}
+
 /// Block while `word` still equals `expected`. No timeout: if the layer never
 /// clears request_sec (no game running), we stay parked at ~0 CPU.
 fn futex_wait(word: &AtomicU32, expected: u32) {
@@ -165,5 +197,14 @@ fn main() {
             "fps={:.1}  min={:.3} ms  max={:.3} ms  (frames={})",
             snap.fps, snap.min_frametime_ms, snap.max_frametime_ms, snap.frame_count
         );
+
+        let tids = read_present_tids(shm);
+        if !tids.is_empty() {
+            let list: Vec<String> = tids
+                .iter()
+                .map(|(tid, max)| format!("{tid}(max {max}/s)"))
+                .collect();
+            println!("  present tids: {}", list.join("  "));
+        }
     }
 }
