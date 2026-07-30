@@ -12,24 +12,39 @@
 // While no game is running the layer never clears request_sec, so we simply
 // stay parked in FUTEX_WAIT at ~0 CPU.
 //
-// Layout mirrors game_fps/fps_shm.h -- both sides must agree on this struct.
+// The tracepoint tables live in a second, independent shm object and need no
+// handshake at all -- they are read straight after each fps result here purely
+// because that is a convenient moment to print them.
+//
+// Layouts mirror game_fps/fps_shm.h and game_fps/vk_trace.h -- both sides must
+// agree on these structs.
 //
 // Env:
-//   LATENCY_SHM_NAME   shm name (default "/game_fps")
+//   LATENCY_SHM_NAME   fps shm name (default "/game_fps")
+//   VK_TRACE_SHM_NAME  tracepoint shm name (default "/vk_trace")
 //   LATENCY_WINDOW_SEC measurement window in seconds (default 1, must be > 0)
 
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// Must match PRESENT_MAX_TIDS / SUBMIT_MAX_TIDS in game_fps/fps_shm.h.
+// Must match PRESENT_MAX_TIDS / SUBMIT_MAX_TIDS in game_fps/vk_trace.h.
 const PRESENT_MAX_TIDS: usize = 4;
 const SUBMIT_MAX_TIDS: usize = 32;
 
-// Must match TidSlot in game_fps/fps_shm.h.
+// Must match TidSlot in game_fps/vk_trace.h.
 #[repr(C)]
 struct TidSlot {
-    tid: AtomicU32,         // 0 = free slot, else the presenting kernel tid
-    max_per_sec: AtomicU32, // high-water mark of presents in any one second
+    tid: AtomicU32,         // 0 = free slot, else the calling kernel tid
+    max_per_sec: AtomicU32, // high-water mark of calls in any one second
+}
+
+// Must match VkTraceShm in game_fps/vk_trace.h. A separate object from FpsShm:
+// no handshake, always valid to read.
+#[repr(C)]
+struct VkTraceShm {
+    present_tids: [TidSlot; PRESENT_MAX_TIDS],
+    // vkQueueSubmit and vkQueueSubmit2 both count here.
+    submit_tids: [TidSlot; SUBMIT_MAX_TIDS],
 }
 
 // Must match FpsShm in game_fps/fps_shm.h.
@@ -41,10 +56,6 @@ struct FpsShm {
     min_frametime_ms: f64,
     max_frametime_ms: f64,
     frame_count: u64,
-
-    present_tids: [TidSlot; PRESENT_MAX_TIDS],
-    // vkQueueSubmit and vkQueueSubmit2 both count here.
-    submit_tids: [TidSlot; SUBMIT_MAX_TIDS],
 }
 
 #[derive(Debug)]
@@ -89,10 +100,10 @@ fn open_shm_fd(cname: &CString) -> Result<i32, String> {
 /// Map the shm read-write (we set the request flag). Either side may start
 /// first: whoever opens it first creates it (see `open_shm_fd`). The mapping
 /// stays valid for the process lifetime (never unmapped here).
-fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
+fn map_shm<T>(name: &str) -> Result<*mut T, String> {
     let cname = CString::new(name).map_err(|e| e.to_string())?;
     let fd = open_shm_fd(&cname).map_err(|e| format!("{e} ({name})"))?;
-    let size = std::mem::size_of::<FpsShm>();
+    let size = std::mem::size_of::<T>();
     // Size the object; harmless if it already exists at this size.
     if unsafe { libc::ftruncate(fd, size as libc::off_t) } != 0 {
         unsafe { libc::close(fd) };
@@ -113,7 +124,7 @@ fn map_shm(name: &str) -> Result<*mut FpsShm, String> {
     if p == libc::MAP_FAILED {
         return Err(format!("mmap failed: {}", std::io::Error::last_os_error()));
     }
-    Ok(p as *mut FpsShm)
+    Ok(p as *mut T)
 }
 
 /// Read the result fields. Safe to read plainly: the handshake guarantees the
@@ -175,7 +186,7 @@ fn main() {
         }
     };
 
-    let shm_ptr = match map_shm(&name) {
+    let shm_ptr = match map_shm::<FpsShm>(&name) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("fps_reader: {e}");
@@ -183,6 +194,16 @@ fn main() {
         }
     };
     let shm = unsafe { &*shm_ptr };
+
+    let trace_name = env_str("VK_TRACE_SHM_NAME", "/vk_trace");
+    let trace_ptr = match map_shm::<VkTraceShm>(&trace_name) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("fps_reader: {e}");
+            std::process::exit(1);
+        }
+    };
+    let trace = unsafe { &*trace_ptr };
 
     eprintln!("fps_reader: reading {name} (request/response, {window_sec}s window)");
 
@@ -202,8 +223,8 @@ fn main() {
         );
 
         for (label, slots) in [
-            ("present", &shm.present_tids[..]),
-            ("submit", &shm.submit_tids[..]),
+            ("present", &trace.present_tids[..]),
+            ("submit", &trace.submit_tids[..]),
         ] {
             let tids = read_tid_table(slots);
             if !tids.is_empty() {

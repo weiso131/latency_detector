@@ -1,10 +1,14 @@
-// Minimal Vulkan layer: intercepts vkQueuePresentKHR, measures frametime, and
-// publishes fps/min/max once per second into a POSIX shared-memory buffer via
-// seqlock (SPSC, latest value wins). The reader side (Rust) is separate.
+// Minimal Vulkan layer publishing two independent shm buffers:
+//   - fps/frametime, sampled on request by a reader (fps_shm.h), fed by
+//     vkQueuePresentKHR;
+//   - which threads call which entry point (vk_trace.h), fed by
+//     vkQueuePresentKHR, vkQueueSubmit and vkQueueSubmit2.
+// Either buffer works without the other; readers map only what they need.
 //
 // Env vars:
-//   LATENCY_SHM_NAME  shm name (default "/game_fps" -> /dev/shm/game_fps)
-//   LATENCY_VERBOSE   if set, also append per-second stats to this file path
+//   LATENCY_SHM_NAME   fps shm name (default "/game_fps")
+//   VK_TRACE_SHM_NAME  tracepoint shm name (default "/vk_trace")
+//   LATENCY_VERBOSE    if set, also append per-second stats to this file path
 //
 // Ref: https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md
 
@@ -27,6 +31,7 @@
 #include <linux/futex.h>
 
 #include "fps_shm.h"
+#include "vk_trace.h"
 #include "tracepoint.h"
 #include "helper.h"
 
@@ -77,36 +82,51 @@ static void reset_window(DeviceData *d, uint64_t now) {
 }
 
 // ---------------------------------------------------------------------------
-// Shared-memory buffer (request/response). Layout lives in fps_shm.h.
+// Shared memory. Two independent objects: the fps request/response buffer
+// (fps_shm.h) and the tracepoint tables (vk_trace.h). They are separate because
+// they answer different questions and share no synchronisation -- a consumer
+// that only wants thread activity maps just the latter.
 // ---------------------------------------------------------------------------
-static FpsShm *g_shm = NULL;   // NULL if shm setup failed -> writes are skipped
-static FILE   *g_verbose = NULL;
+static FpsShm     *g_fps_shm = NULL;   // NULL if setup failed -> writes skipped
+static VkTraceShm *g_trace_shm = NULL;
+static FILE       *g_verbose = NULL;
 
 // One tracepoint per kind of intercepted call, bound to its shm array below.
 // vkQueueSubmit and vkQueueSubmit2 both feed g_submit_tp.
 TRACEPOINT_DEFINE(g_present_tp, TP_PRESENT, PRESENT_MAX_TIDS);
 TRACEPOINT_DEFINE(g_submit_tp,  TP_SUBMIT,  SUBMIT_MAX_TIDS);
 
-static void ipc_init(void) {
-    const char *name = getenv("LATENCY_SHM_NAME");
-    if (!name || !*name)
-        name = FPS_SHM_DEFAULT_NAME;
-
+// Create (or open) a shm object of `size` and map it read-write. Returns NULL
+// on any failure; each buffer is optional, so a caller just goes without.
+static void *map_shm(const char *name, size_t size) {
     int fd = shm_open(name, O_CREAT | O_RDWR, 0666);
     if (fd < 0)
-        return;
+        return NULL;
     fchmod(fd, 0666);
-    if (ftruncate(fd, sizeof(FpsShm)) != 0) {
+    if (ftruncate(fd, size) != 0) {
         close(fd);
-        return;
+        return NULL;
     }
-    void *p = mmap(NULL, sizeof(FpsShm), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (p == MAP_FAILED)
-        return;
-    g_shm = (FpsShm *)p;
-    tp_bind(&g_present_tp, g_shm->present_tids);
-    tp_bind(&g_submit_tp, g_shm->submit_tids);
+    return p == MAP_FAILED ? NULL : p;
+}
+
+static const char *env_or(const char *key, const char *fallback) {
+    const char *v = getenv(key);
+    return (v && *v) ? v : fallback;
+}
+
+static void ipc_init(void) {
+    g_fps_shm = map_shm(env_or("LATENCY_SHM_NAME", FPS_SHM_DEFAULT_NAME),
+                        sizeof(FpsShm));
+
+    g_trace_shm = map_shm(env_or("VK_TRACE_SHM_NAME", VK_TRACE_DEFAULT_NAME),
+                          sizeof(VkTraceShm));
+    if (g_trace_shm) {
+        tp_bind(&g_present_tp, g_trace_shm->present_tids);
+        tp_bind(&g_submit_tp, g_trace_shm->submit_tids);
+    }
 
     const char *vpath = getenv("LATENCY_VERBOSE");
     if (vpath && *vpath)
@@ -115,7 +135,7 @@ static void ipc_init(void) {
 
 // Wake the reader parked on FUTEX_WAIT(request_sec). No-op if none is waiting.
 static void futex_wake_request(void) {
-    syscall(SYS_futex, &g_shm->request_sec, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
+    syscall(SYS_futex, &g_fps_shm->request_sec, FUTEX_WAKE, INT32_MAX, NULL, NULL, 0);
 }
 
 // Write one result, then release it: request_sec = 0 marks "result ready" and,
@@ -123,12 +143,12 @@ static void futex_wake_request(void) {
 // re-arms. The store-release publishes the field writes before the word drops.
 static void write_result(double fps, double min_ms, double max_ms,
                          uint64_t frames) {
-    g_shm->fps = fps;
-    g_shm->min_frametime_ms = min_ms;
-    g_shm->max_frametime_ms = max_ms;
-    g_shm->frame_count = frames;
+    g_fps_shm->fps = fps;
+    g_fps_shm->min_frametime_ms = min_ms;
+    g_fps_shm->max_frametime_ms = max_ms;
+    g_fps_shm->frame_count = frames;
 
-    atomic_store_explicit(&g_shm->request_sec, 0, memory_order_release);
+    atomic_store_explicit(&g_fps_shm->request_sec, 0, memory_order_release);
     futex_wake_request();
 
     if (g_verbose) {
@@ -149,7 +169,7 @@ layer_QueueSubmit(VkQueue queue, uint32_t submitCount,
     if (!d || !d->next_submit)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    if (g_shm)
+    if (g_trace_shm)
         tp_record(&g_submit_tp, now_ns());
 
     return d->next_submit(queue, submitCount, pSubmits, fence);
@@ -162,7 +182,7 @@ layer_QueueSubmit2(VkQueue queue, uint32_t submitCount,
     if (!d || !d->next_submit2)
         return VK_ERROR_INITIALIZATION_FAILED;
 
-    if (g_shm)
+    if (g_trace_shm)
         tp_record(&g_submit_tp, now_ns());
 
     return d->next_submit2(queue, submitCount, pSubmits, fence);
@@ -183,13 +203,14 @@ layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
     d->last_present_ns = now;
     d->have_last = 1;
 
-    if (g_shm) {
+    if (g_trace_shm)
         tp_record(&g_present_tp, now);
 
+    if (g_fps_shm) {
         // The request word is the only state: nonzero means a window of that
         // many seconds is wanted. window_start_ns == 0 means we have not opened
         // one yet.
-        uint32_t req = atomic_load_explicit(&g_shm->request_sec, memory_order_acquire);
+        uint32_t req = atomic_load_explicit(&g_fps_shm->request_sec, memory_order_acquire);
 
         if (d->window_start_ns == 0) {
             if (req != 0)

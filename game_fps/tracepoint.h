@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "fps_shm.h"
+#include "vk_trace.h"
 
 // Fixed id per tracepoint; indexes the per-thread slot cache. Every tracepoint
 // needs its own, and TP_COUNT sizes the cache.
